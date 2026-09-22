@@ -1,5 +1,5 @@
 # =====================================================================
-# IMPORTAÇÕES DO SISTEMA (Agora focado em ambiente Web)
+# IMPORTAÇÕES DO SISTEMA (Ambiente Web Streamlit)
 # =====================================================================
 import streamlit as st
 import pandas as pd
@@ -7,7 +7,7 @@ import pdfplumber
 import re
 import unicodedata
 from datetime import datetime, timedelta
-import io # Biblioteca para manipular ficheiros na memória da internet
+import io 
 from docx import Document
 from docx.shared import RGBColor, Pt
 
@@ -17,7 +17,7 @@ from docx.shared import RGBColor, Pt
 st.set_page_config(page_title="Auditoria de Diários", page_icon="🏫", layout="wide")
 
 st.title("🏫 Sistema de Gestão e Auditoria de Diário Escolar")
-st.markdown("Bem-vindo! Preencha as configurações abaixo, envie o PDF e o sistema gerará a auditoria automaticamente.")
+st.markdown("Bem-vindo! Preencha as configurações abaixo, envie o PDF de uma disciplina e o sistema gerará a auditoria.")
 
 # =====================================================================
 # INTERFACE DO UTILIZADOR (FORMULÁRIO LATERAL E PRINCIPAL)
@@ -68,7 +68,6 @@ with col2:
 
 st.markdown("---")
 st.header("📂 Envio do Diário (PDF)")
-# Novo uploader de arquivos do Streamlit
 arquivo_pdf = st.file_uploader("Arraste e solte o Diário Escolar aqui", type=["pdf"])
 
 # =====================================================================
@@ -104,10 +103,23 @@ def extrair_data_segura(texto):
     if match: return datetime.strptime(match.group(), "%d/%m/%Y")
     return datetime.min
 
+# 🔴 NOVO: Scanner Inteligente de Números (Resolve os dias engolidos)
+def limpar_numeros(texto):
+    blocos = re.findall(r'\d+', str(texto))
+    resultado = []
+    for b in blocos:
+        if len(b) > 2: 
+            # Se juntou as colunas (ex: 0909), fatia de 2 em 2
+            resultado.extend([b[i:i+2] for i in range(0, len(b), 2)])
+        else:
+            # Se for normal (ex: 9 ou 11), guarda inteiro
+            resultado.append(b)
+    # Devolve tudo preenchido com zero à esquerda (ex: 9 vira 09)
+    return [x.zfill(2) for x in resultado if x]
+
 # =====================================================================
 # AÇÃO DO BOTÃO PRINCIPAL E PROCESSAMENTO
 # =====================================================================
-# O Streamlit roda este bloco apenas quando o utilizador clica no botão
 if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
     
     if not arquivo_pdf:
@@ -115,10 +127,8 @@ if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
     elif not disciplina_nome:
         st.error("Por favor, informe o nome da disciplina nas configurações.")
     else:
-        # Mostra uma mensagem de carregamento bonita no site
         with st.spinner('A analisar o diário e a aplicar Inteligência Artificial...'):
             
-            # --- MOTOR DE EXTRAÇÃO (A nossa lógica rigorosa mantida intacta) ---
             alunos_dict, notas_dict = {}, {}
             lista_conteudos, lista_ocorrencias = [], []
             aulas_por_bimestre, aulas_registradas_calendario = {}, {}
@@ -126,7 +136,6 @@ if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
             padrao_data = re.compile(r'\d{2}/\d{2}/\d{4}') 
             
             try:
-                # O pdfplumber consegue ler diretamente do arquivo enviado pelo Streamlit
                 with pdfplumber.open(arquivo_pdf) as pdf:
                     for pagina in pdf.pages:
                         texto_pagina = pagina.extract_text() or ""
@@ -145,7 +154,7 @@ if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
                         for idx_tabela, tabela in enumerate(tabelas):
                             if len(tabela) < 2: continue 
                             
-                            # Frequência Absoluta
+                            # 🔴 Leitura Imbatível da Frequência Absoluta
                             for idx_linha, linha in enumerate(tabela):
                                 linha_mes_texto = " ".join([str(c).lower() for c in linha if c])
                                 if re.search(r'\bm[êe]s\b', linha_mes_texto):
@@ -157,15 +166,13 @@ if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
                                             temp_count = {}
                                             for m_cell, d_cell in zip(linha, linha_dia):
                                                 if m_cell and d_cell:
-                                                    m_str_full = re.sub(r'\D', '', str(m_cell))
-                                                    d_str_full = re.sub(r'\D', '', str(d_cell))
-                                                    ms = [m_str_full[i:i+2] for i in range(0, len(m_str_full), 2)]
-                                                    ds = [d_str_full[i:i+2] for i in range(0, len(d_str_full), 2)]
+                                                    # Usa a nova função que não perde números nenhuns
+                                                    ms = limpar_numeros(m_cell)
+                                                    ds = limpar_numeros(d_cell)
                                                     
                                                     for m_str, d_str in zip(ms, ds):
-                                                        if len(m_str) == 2 and len(d_str) == 2:
-                                                            data_formatada = f"{d_str}/{m_str}/{ano_vigente}"
-                                                            temp_count[data_formatada] = temp_count.get(data_formatada, 0) + 1
+                                                        data_formatada = f"{d_str}/{m_str}/{ano_vigente}"
+                                                        temp_count[data_formatada] = temp_count.get(data_formatada, 0) + 1
                                             
                                             for dt, count in temp_count.items():
                                                 if count > aulas_registradas_calendario.get(dt, 0):
@@ -173,15 +180,19 @@ if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
 
                             header_text = " ".join([str(cell) for row in tabela[:5] for cell in row if cell]).lower()
                             
+                            # 🔴 Leitura de Conteúdos com Extração a Laser da Data
                             if pagina_de_conteudo or "conteúdo" in header_text:
                                 for linha in tabela:
                                     data_encontrada, texto_conteudo = None, ""
                                     for idx_celula, celula in enumerate(linha):
                                         celula_str = str(celula).strip()
-                                        if padrao_data.match(celula_str):
-                                            data_encontrada = celula_str
+                                        match_data = padrao_data.search(celula_str)
+                                        if match_data:
+                                            # Pega a data purinha, ignorando espaços inúteis
+                                            data_encontrada = match_data.group()
                                             texto_conteudo = " ".join([str(c).strip() for c in linha[idx_celula+1:] if c and str(c).strip() != "None"])
                                             break 
+                                            
                                     if data_encontrada and texto_valido(texto_conteudo): 
                                         dia_semana = obter_dia_semana(data_encontrada)
                                         datas_com_conteudo_valido.add(data_encontrada)
@@ -191,8 +202,9 @@ if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
                                 for linha in tabela:
                                     for idx_celula, celula in enumerate(linha):
                                         celula_str = str(celula).strip()
-                                        if padrao_data.match(celula_str):
-                                            data_encontrada = celula_str
+                                        match_data = padrao_data.search(celula_str)
+                                        if match_data:
+                                            data_encontrada = match_data.group()
                                             texto_ocorrencia = " ".join([str(c).strip() for c in linha[idx_celula+1:] if c and str(c).strip() != "None"])
                                             if texto_valido(texto_ocorrencia):
                                                 dia_semana = obter_dia_semana(data_encontrada)
@@ -291,7 +303,7 @@ if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
                             vals = " -> ".join(map(str, sorted(list(horarios_deste_dia)))) 
                             nome_dia = obter_dia_semana(datas_wd[0]).split("-")[0]
                             grade_resumo_texto[wd] = f"Var. ({vals})"
-                            observacoes_mudanca_horario.append(f"🔄 {nome_dia}: O horário sofreu mudança ({vals} aulas totais na grade do dia).")
+                            observacoes_mudanca_horario.append(f"🔄 {nome_dia}: O horário sofreu mudança ({vals} aulas totais).")
                         else:
                             grade_resumo_texto[wd] = f"{ultimo_valor}"
 
@@ -347,9 +359,9 @@ if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
                                 if nome_dia == "Sábado":
                                     tem_ocorrencia = any(data_aula in o for o in lista_ocorrencias)
                                     if not tem_ocorrencia:
-                                        alertas_conteudo_faltante.append(f"❌ {data_aula} ({nome_dia}): Sábado letivo teve frequência lançada, mas não há conteúdo/ocorrência!")
+                                        alertas_conteudo_faltante.append(f"❌ {data_aula} ({nome_dia}): Sábado letivo teve frequência, mas não há conteúdo/ocorrência!")
                                 else:
-                                    alertas_conteudo_faltante.append(f"❌ {data_aula} ({nome_dia}): Tem frequência lançada ({aulas_registradas_calendario[data_aula]} aula(s)), mas ESQUECEU o conteúdo!")
+                                    alertas_conteudo_faltante.append(f"❌ {data_aula} ({nome_dia}): Tem frequência ({aulas_registradas_calendario[data_aula]} aula(s)), mas ESQUECEU o conteúdo!")
 
                     df_alunos['soma_notas_parcial'] = 0.0
                     df_alunos['soma_faltas_parcial'] = 0
@@ -498,7 +510,6 @@ if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
                                 if item[3].split(" ")[0] != item[4].split(" ")[0]:
                                     row[3].paragraphs[0].runs[0].font.color.rgb = RGBColor(204, 102, 0)
 
-                    # --- EXPORTAÇÃO WEB SEGURA (Sem usar os discos do servidor) ---
                     nome_seguro = re.sub(r'[\\/*?:"<>|]', "_", disciplina_nome)
                     nome_arquivo_word = f"Relatorio_{nome_seguro}.docx"
                     
@@ -508,7 +519,6 @@ if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
                     
                     st.success("✅ Relatório gerado com sucesso!")
                     
-                    # Cria o botão mágico de download do Streamlit
                     st.download_button(
                         label="📥 Clique aqui para BAIXAR O RELATÓRIO",
                         data=buffer,
