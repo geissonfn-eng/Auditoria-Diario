@@ -1,0 +1,520 @@
+# =====================================================================
+# IMPORTAÇÕES DO SISTEMA (Agora focado em ambiente Web)
+# =====================================================================
+import streamlit as st
+import pandas as pd
+import pdfplumber
+import re
+import unicodedata
+from datetime import datetime, timedelta
+import io # Biblioteca para manipular ficheiros na memória da internet
+from docx import Document
+from docx.shared import RGBColor, Pt
+
+# =====================================================================
+# CONFIGURAÇÃO VISUAL DA PÁGINA STREAMLIT
+# =====================================================================
+st.set_page_config(page_title="Auditoria de Diários", page_icon="🏫", layout="wide")
+
+st.title("🏫 Sistema de Gestão e Auditoria de Diário Escolar")
+st.markdown("Bem-vindo! Preencha as configurações abaixo, envie o PDF e o sistema gerará a auditoria automaticamente.")
+
+# =====================================================================
+# INTERFACE DO UTILIZADOR (FORMULÁRIO LATERAL E PRINCIPAL)
+# =====================================================================
+with st.sidebar:
+    st.header("⚙️ Configurações da Turma")
+    
+    disciplina_nome = st.text_input("Qual o NOME DA DISCIPLINA? (Ex: MATEMÁTICA)", value="MATEMÁTICA").strip().upper()
+    
+    bimestres_str = st.text_input("Bimestres analisados (Ex: 1, 2):", value="1")
+    bimestres_selecionados = [int(b.strip()) for b in bimestres_str.split(",") if b.strip().isdigit()]
+    
+    st.subheader("Distribuição de Pontos")
+    valores_bimestres = {}
+    meta_parcial_aprovacao = 0.0
+    for b in bimestres_selecionados:
+        valor = st.number_input(f"Valor do {b}º Bimestre (0 se não houver):", min_value=0.0, value=0.0, step=1.0)
+        valores_bimestres[b] = float(valor)
+        meta_parcial_aprovacao += (valor * 0.6)
+        
+    limite_faltas_configurado = st.number_input("Limite de faltas para alerta:", min_value=0, value=40)
+
+st.header("📅 Calendário e Horários")
+col1, col2 = st.columns(2)
+
+with col1:
+    data_inicio_str = st.text_input("Data de INÍCIO (DD/MM/AAAA):", value="09/02/2026")
+    data_fim_str = st.text_input("Data FINAL (DD/MM/AAAA):", value="29/04/2026")
+    try: ano_vigente = data_inicio_str.split("/")[-1]
+    except: ano_vigente = "2026"
+    feriados_str = st.text_input("Feriados/Recessos (separados por vírgula):", value="")
+    feriados_lista = [f.strip() for f in feriados_str.split(",") if f.strip()]
+
+with col2:
+    opcao_grade = st.radio("Como o sistema saberá a Grade de Horários?", 
+                           ("Descobrir automaticamente (Inteligência Artificial)", "Inserir manualmente"))
+    grade_automatica = (opcao_grade == "Descobrir automaticamente (Inteligência Artificial)")
+    
+    grade_semanal_manual = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
+    if not grade_automatica:
+        st.write("Insira a quantidade de aulas por dia:")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        grade_semanal_manual[0] = c1.number_input("Seg", min_value=0, value=0)
+        grade_semanal_manual[1] = c2.number_input("Ter", min_value=0, value=0)
+        grade_semanal_manual[2] = c3.number_input("Qua", min_value=0, value=0)
+        grade_semanal_manual[3] = c4.number_input("Qui", min_value=0, value=0)
+        grade_semanal_manual[4] = c5.number_input("Sex", min_value=0, value=0)
+
+st.markdown("---")
+st.header("📂 Envio do Diário (PDF)")
+# Novo uploader de arquivos do Streamlit
+arquivo_pdf = st.file_uploader("Arraste e solte o Diário Escolar aqui", type=["pdf"])
+
+# =====================================================================
+# CAIXA DE FERRAMENTAS DO SISTEMA
+# =====================================================================
+def converter_nota(valor):
+    if not valor: return 0.0
+    texto = str(valor).replace(",", ".").strip()
+    if texto in ["", "-", "---", "nan", "None"]: return 0.0
+    try: return float(texto)
+    except: return 0.0
+
+def converter_falta(valor):
+    if not valor: return 0
+    texto = str(valor).strip()
+    if texto in ["", "-", "---", "nan", "None"]: return 0
+    try: return int(float(texto))
+    except: return 0
+
+def obter_dia_semana(data_str):
+    try:
+        data_obj = datetime.strptime(data_str, "%d/%m/%Y")
+        dias = ["Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado", "Domingo"]
+        return dias[data_obj.weekday()]
+    except: return ""
+
+def texto_valido(texto):
+    if not texto: return False
+    return bool(re.search(r'[a-zA-Z0-9]', str(texto)))
+
+def extrair_data_segura(texto):
+    match = re.search(r'\d{2}/\d{2}/\d{4}', str(texto))
+    if match: return datetime.strptime(match.group(), "%d/%m/%Y")
+    return datetime.min
+
+# =====================================================================
+# AÇÃO DO BOTÃO PRINCIPAL E PROCESSAMENTO
+# =====================================================================
+# O Streamlit roda este bloco apenas quando o utilizador clica no botão
+if st.button("🚀 Gerar Auditoria Completa", use_container_width=True):
+    
+    if not arquivo_pdf:
+        st.error("Por favor, envie o documento PDF antes de gerar a auditoria.")
+    elif not disciplina_nome:
+        st.error("Por favor, informe o nome da disciplina nas configurações.")
+    else:
+        # Mostra uma mensagem de carregamento bonita no site
+        with st.spinner('A analisar o diário e a aplicar Inteligência Artificial...'):
+            
+            # --- MOTOR DE EXTRAÇÃO (A nossa lógica rigorosa mantida intacta) ---
+            alunos_dict, notas_dict = {}, {}
+            lista_conteudos, lista_ocorrencias = [], []
+            aulas_por_bimestre, aulas_registradas_calendario = {}, {}
+            datas_com_conteudo_valido = set() 
+            padrao_data = re.compile(r'\d{2}/\d{2}/\d{4}') 
+            
+            try:
+                # O pdfplumber consegue ler diretamente do arquivo enviado pelo Streamlit
+                with pdfplumber.open(arquivo_pdf) as pdf:
+                    for pagina in pdf.pages:
+                        texto_pagina = pagina.extract_text() or ""
+                        tabelas = pagina.extract_tables()
+                        texto_plano = re.sub(r'\s+', ' ', texto_pagina).lower()
+                        
+                        match_aulas = re.search(r'm[óo]dulos aulas ministrados\D*(\d+)', texto_plano)
+                        match_bim = re.search(r'bimestre\D*(\d)º?', texto_plano)
+                        if match_aulas and match_bim:
+                            num_bimestre = int(match_bim.group(1))
+                            if 1 <= num_bimestre <= 4: aulas_por_bimestre[num_bimestre] = int(match_aulas.group(1))
+                        
+                        pagina_de_ocorrencia = "ocorrência" in texto_plano or "ocorrencia" in texto_plano
+                        pagina_de_conteudo = "conteúdo" in texto_plano or "conteudo" in texto_plano
+                        
+                        for idx_tabela, tabela in enumerate(tabelas):
+                            if len(tabela) < 2: continue 
+                            
+                            # Frequência Absoluta
+                            for idx_linha, linha in enumerate(tabela):
+                                linha_mes_texto = " ".join([str(c).lower() for c in linha if c])
+                                if re.search(r'\bm[êe]s\b', linha_mes_texto):
+                                    if len(tabela) > idx_linha + 1:
+                                        linha_dia = tabela[idx_linha+1]
+                                        linha_dia_texto = " ".join([str(c).lower() for c in linha_dia if c])
+                                        
+                                        if re.search(r'\bdia\b', linha_dia_texto):
+                                            temp_count = {}
+                                            for m_cell, d_cell in zip(linha, linha_dia):
+                                                if m_cell and d_cell:
+                                                    m_str_full = re.sub(r'\D', '', str(m_cell))
+                                                    d_str_full = re.sub(r'\D', '', str(d_cell))
+                                                    ms = [m_str_full[i:i+2] for i in range(0, len(m_str_full), 2)]
+                                                    ds = [d_str_full[i:i+2] for i in range(0, len(d_str_full), 2)]
+                                                    
+                                                    for m_str, d_str in zip(ms, ds):
+                                                        if len(m_str) == 2 and len(d_str) == 2:
+                                                            data_formatada = f"{d_str}/{m_str}/{ano_vigente}"
+                                                            temp_count[data_formatada] = temp_count.get(data_formatada, 0) + 1
+                                            
+                                            for dt, count in temp_count.items():
+                                                if count > aulas_registradas_calendario.get(dt, 0):
+                                                    aulas_registradas_calendario[dt] = count
+
+                            header_text = " ".join([str(cell) for row in tabela[:5] for cell in row if cell]).lower()
+                            
+                            if pagina_de_conteudo or "conteúdo" in header_text:
+                                for linha in tabela:
+                                    data_encontrada, texto_conteudo = None, ""
+                                    for idx_celula, celula in enumerate(linha):
+                                        celula_str = str(celula).strip()
+                                        if padrao_data.match(celula_str):
+                                            data_encontrada = celula_str
+                                            texto_conteudo = " ".join([str(c).strip() for c in linha[idx_celula+1:] if c and str(c).strip() != "None"])
+                                            break 
+                                    if data_encontrada and texto_valido(texto_conteudo): 
+                                        dia_semana = obter_dia_semana(data_encontrada)
+                                        datas_com_conteudo_valido.add(data_encontrada)
+                                        lista_conteudos.append({'data': data_encontrada, 'dia': dia_semana, 'texto': texto_conteudo})
+                                                
+                            if pagina_de_ocorrencia or "ocorrência" in header_text:
+                                for linha in tabela:
+                                    for idx_celula, celula in enumerate(linha):
+                                        celula_str = str(celula).strip()
+                                        if padrao_data.match(celula_str):
+                                            data_encontrada = celula_str
+                                            texto_ocorrencia = " ".join([str(c).strip() for c in linha[idx_celula+1:] if c and str(c).strip() != "None"])
+                                            if texto_valido(texto_ocorrencia):
+                                                dia_semana = obter_dia_semana(data_encontrada)
+                                                lista_ocorrencias.append(f"{data_encontrada} ({dia_semana}) - {texto_ocorrencia}")
+                                            break
+                        
+                            if len(tabela) < 3: continue 
+                            if "nome do aluno" in header_text or "matrícula" in header_text:
+                                for linha in tabela[1:]:
+                                    if linha and linha[0] and str(linha[0]).strip().isdigit():
+                                        num = int(str(linha[0]).strip())
+                                        nome = linha[3].replace("\n", " ").strip() if len(linha) > 3 else ""
+                                        if nome and nome.lower() not in ["", "none", "nan", "-"]:
+                                            alunos_dict[num] = nome
+                                            if num not in notas_dict: notas_dict[num] = {"1ºB": 0.0, "2ºB": 0.0, "3ºB": 0.0, "4ºB": 0.0, "F1": 0, "F2": 0, "F3": 0, "F4": 0, "Observacao": "-"}
+                            
+                            elif "processo" in header_text and "produto" in header_text:
+                                for linha in tabela[2:]:
+                                    if linha and linha[0] and str(linha[0]).strip().isdigit():
+                                        num = int(str(linha[0]).strip())
+                                        if num in notas_dict:
+                                            notas_dict[num]["1ºB"] = converter_nota(linha[3]) if len(linha) > 3 else notas_dict[num]["1ºB"]
+                                            notas_dict[num]["2ºB"] = converter_nota(linha[6]) if len(linha) > 6 else notas_dict[num]["2ºB"]
+                                            notas_dict[num]["3ºB"] = converter_nota(linha[9]) if len(linha) > 9 else notas_dict[num]["3ºB"]
+                                            notas_dict[num]["4ºB"] = converter_nota(linha[12]) if len(linha) > 12 else notas_dict[num]["4ºB"]
+                            
+                            elif "resultado anual" in header_text or "faltas" in header_text:
+                                for linha in tabela[2:]: 
+                                    if linha and linha[0] and str(linha[0]).strip().isdigit():
+                                        num = int(str(linha[0]).strip())
+                                        if num in notas_dict:
+                                            notas_dict[num]["F1"] = converter_falta(linha[-7]) if len(linha) >= 7 else notas_dict[num]["F1"]
+                                            notas_dict[num]["F2"] = converter_falta(linha[-6]) if len(linha) >= 6 else notas_dict[num]["F2"]
+                                            notas_dict[num]["F3"] = converter_falta(linha[-5]) if len(linha) >= 5 else notas_dict[num]["F3"]
+                                            notas_dict[num]["F4"] = converter_falta(linha[-4]) if len(linha) >= 4 else notas_dict[num]["F4"]
+                                            obs = str(linha[-1]).replace("\n", "").strip() if len(linha) > 0 else "-"
+                                            notas_dict[num]["Observacao"] = "-" if obs in ["", "None", "nan", "---", "-"] else obs
+
+                notas_finais = []
+                for num, dados in notas_dict.items():
+                    nome_real = alunos_dict.get(num)
+                    if nome_real: 
+                        dados["Nº"] = num
+                        dados["Nome"] = nome_real
+                        notas_finais.append(dados)
+                        
+                df_alunos = pd.DataFrame(notas_finais)
+                if not df_alunos.empty: df_alunos = df_alunos.sort_values(by="Nº")
+                
+                # --- AUDITORIA IA FOCADA E CRIAÇÃO DO WORD ---
+                if df_alunos is not None and not df_alunos.empty:
+                    try:
+                        dt_inicio_per = datetime.strptime(data_inicio_str, "%d/%m/%Y")
+                        dt_fim_per = datetime.strptime(data_fim_str, "%d/%m/%Y")
+                    except:
+                        dt_inicio_per, dt_fim_per = datetime.min, datetime.max
+
+                    todas_datas_periodo = []
+                    dia_atual = dt_inicio_per
+                    while dia_atual <= dt_fim_per and dia_atual != datetime.min:
+                        todas_datas_periodo.append(dia_atual.strftime("%d/%m/%Y"))
+                        dia_atual += timedelta(days=1)
+
+                    grade_esperada_por_data = {}
+                    observacoes_mudanca_horario = []
+                    grade_resumo_texto = {0: "-", 1: "-", 2: "-", 3: "-", 4: "-"} 
+                    
+                    for wd in range(5): 
+                        datas_wd = [d for d in todas_datas_periodo if datetime.strptime(d, "%d/%m/%Y").weekday() == wd and d not in feriados_lista]
+                        
+                        if not grade_automatica:
+                            for d in datas_wd: grade_esperada_por_data[d] = grade_semanal_manual[wd]
+                            grade_resumo_texto[wd] = f"{grade_semanal_manual[wd]} aula(s)"
+                            continue
+                            
+                        valores_conhecidos = {}
+                        for d in datas_wd:
+                            lancado = aulas_registradas_calendario.get(d, 0)
+                            if lancado > 0: valores_conhecidos[d] = lancado
+                            
+                        if not valores_conhecidos:
+                            for d in datas_wd: grade_esperada_por_data[d] = 0
+                            grade_resumo_texto[wd] = "0"
+                            continue
+                            
+                        datas_conhecidas_ord = sorted(valores_conhecidos.keys(), key=lambda x: datetime.strptime(x, "%d/%m/%Y"))
+                        ultimo_valor = valores_conhecidos[datas_conhecidas_ord[0]] 
+                        
+                        horarios_deste_dia = set()
+                        for d in datas_wd:
+                            if d in valores_conhecidos: ultimo_valor = valores_conhecidos[d]
+                            grade_esperada_por_data[d] = ultimo_valor
+                            horarios_deste_dia.add(ultimo_valor)
+                            
+                        if len(horarios_deste_dia) > 1:
+                            vals = " -> ".join(map(str, sorted(list(horarios_deste_dia)))) 
+                            nome_dia = obter_dia_semana(datas_wd[0]).split("-")[0]
+                            grade_resumo_texto[wd] = f"Var. ({vals})"
+                            observacoes_mudanca_horario.append(f"🔄 {nome_dia}: O horário sofreu mudança ({vals} aulas totais na grade do dia).")
+                        else:
+                            grade_resumo_texto[wd] = f"{ultimo_valor}"
+
+                    conteudos_no_periodo = []
+                    conteudos_fora_periodo = []
+                    eventos_de_sabado = []
+                    resumo_calendario_visual = {} 
+                    
+                    for c in lista_conteudos:
+                        dt_obj = extrair_data_segura(c['data'])
+                        esta_no_periodo = (dt_inicio_per <= dt_obj <= dt_fim_per)
+                        texto_formatado = f"{c['data']} ({c['dia']}) - {c['texto']}"
+                        
+                        if esta_no_periodo:
+                            if c['data'] not in resumo_calendario_visual: resumo_calendario_visual[c['data']] = {'freq': 0, 'cont': 0}
+                            resumo_calendario_visual[c['data']]['cont'] += 1
+                        
+                        if c['dia'] == "Sábado": eventos_de_sabado.append(f"📌 {texto_formatado}")
+                        else:
+                            if esta_no_periodo: conteudos_no_periodo.append(texto_formatado)
+                            else: conteudos_fora_periodo.append(texto_formatado)
+                            
+                    for dt_freq, qtd_freq in aulas_registradas_calendario.items():
+                        dt_obj = extrair_data_segura(dt_freq)
+                        if dt_inicio_per <= dt_obj <= dt_fim_per:
+                            if dt_freq not in resumo_calendario_visual: resumo_calendario_visual[dt_freq] = {'freq': 0, 'cont': 0}
+                            resumo_calendario_visual[dt_freq]['freq'] = qtd_freq
+                        
+                    ocorrencias_periodo = []
+                    ocorrencias_fora = []
+                    for o in lista_ocorrencias:
+                        if "(Sábado)" in o: eventos_de_sabado.append(f"📌 {o} [Ocorrência/Reunião]")
+                        else:
+                            dt_obj = extrair_data_segura(o)
+                            if dt_inicio_per <= dt_obj <= dt_fim_per: ocorrencias_periodo.append(o)
+                            else: ocorrencias_fora.append(o)
+                    
+                    alertas_de_lancamento = []
+                    for data_str, aulas_esperadas in grade_esperada_por_data.items():
+                        if aulas_esperadas > 0:
+                            aulas_lancadas = aulas_registradas_calendario.get(data_str, 0)
+                            if aulas_lancadas < aulas_esperadas:
+                                nome_dia = obter_dia_semana(data_str)
+                                alertas_de_lancamento.append(f"⚠️ {data_str} ({nome_dia}): Frequência Incompleta! Esperava {aulas_esperadas} aula(s) | Lançou {aulas_lancadas}")
+                    alertas_de_lancamento.sort(key=extrair_data_segura)
+
+                    alertas_conteudo_faltante = []
+                    for data_aula in sorted(aulas_registradas_calendario.keys(), key=lambda d: datetime.strptime(d, "%d/%m/%Y")):
+                        dt_obj = extrair_data_segura(data_aula)
+                        if dt_inicio_per <= dt_obj <= dt_fim_per:
+                            if aulas_registradas_calendario.get(data_aula, 0) > 0 and data_aula not in datas_com_conteudo_valido:
+                                nome_dia = obter_dia_semana(data_aula)
+                                if nome_dia == "Sábado":
+                                    tem_ocorrencia = any(data_aula in o for o in lista_ocorrencias)
+                                    if not tem_ocorrencia:
+                                        alertas_conteudo_faltante.append(f"❌ {data_aula} ({nome_dia}): Sábado letivo teve frequência lançada, mas não há conteúdo/ocorrência!")
+                                else:
+                                    alertas_conteudo_faltante.append(f"❌ {data_aula} ({nome_dia}): Tem frequência lançada ({aulas_registradas_calendario[data_aula]} aula(s)), mas ESQUECEU o conteúdo!")
+
+                    df_alunos['soma_notas_parcial'] = 0.0
+                    df_alunos['soma_faltas_parcial'] = 0
+                    for b in bimestres_selecionados:
+                        df_alunos['soma_notas_parcial'] += df_alunos[f'{b}ºB']
+                        df_alunos['soma_faltas_parcial'] += df_alunos[f'F{b}']
+
+                    def classificar_status(linha):
+                        obs = str(linha['Observacao']).upper()
+                        if "TRANSF" in obs or "REMAN" in obs: return f"⚠️ {obs}"
+                        alerta_nota = False
+                        if meta_parcial_aprovacao > 0: alerta_nota = linha['soma_notas_parcial'] < meta_parcial_aprovacao
+                        alerta_falta = linha['soma_faltas_parcial'] > limite_faltas_configurado
+                        qnt_faltas = linha['soma_faltas_parcial']
+                        if alerta_nota and alerta_falta: return f"❌ ALERTA (Nota | Faltas: {qnt_faltas})"
+                        elif alerta_nota: return "❌ ALERTA (Nota)"
+                        elif alerta_falta: return f"❌ ALERTA (Faltas: {qnt_faltas})"
+                        else: return "✅ OK"
+
+                    df_alunos['situacao'] = df_alunos.apply(classificar_status, axis=1)
+
+                    # --- CRIAÇÃO DO WORD NA MEMÓRIA ---
+                    doc = Document()
+                    doc.add_heading(f'📊 RELATÓRIO DE GESTÃO DA TURMA - {disciplina_nome}', level=1)
+                    
+                    texto_bimestres = ", ".join([f"{b}º" for b in bimestres_selecionados]) + " Bimestre(s)"
+                    doc.add_paragraph(f"Bimestres Analisados: {texto_bimestres} (De {data_inicio_str} a {data_fim_str})")
+                    if meta_parcial_aprovacao > 0: doc.add_paragraph(f"Meta Mínima para Aprovação no Período (60%): {meta_parcial_aprovacao:.1f} pontos")
+                    doc.add_paragraph(f"Frequência Crítica: Acima de {limite_faltas_configurado} faltas acumuladas")
+                    
+                    texto_grade_cabecalho = "🤖 Grade da Frequência: " if grade_automatica else "📝 Grade Manual: "
+                    texto_grade_cabecalho += f"Seg: {grade_resumo_texto.get(0, '-')} | Ter: {grade_resumo_texto.get(1, '-')} | Qua: {grade_resumo_texto.get(2, '-')} | Qui: {grade_resumo_texto.get(3, '-')} | Sex: {grade_resumo_texto.get(4, '-')}"
+                    p_grade = doc.add_paragraph(texto_grade_cabecalho)
+                    p_grade.runs[0].font.bold = True
+                    if grade_automatica: p_grade.runs[0].font.color.rgb = RGBColor(0, 102, 204)
+                        
+                    if observacoes_mudanca_horario:
+                        for obs in observacoes_mudanca_horario:
+                            p_obs = doc.add_paragraph(obs)
+                            p_obs.runs[0].font.color.rgb = RGBColor(204, 102, 0)
+                    
+                    doc.add_heading('📋 TABELA DE DESEMPENHO', level=2)
+                    tabela = doc.add_table(rows=1, cols=9)
+                    tabela.style = 'Table Grid'
+                    
+                    hdr_cells = tabela.rows[0].cells
+                    cabecalhos = ['Nº', 'Nome', '1ºB', '2ºB', '3ºB', '4ºB', 'Soma', 'Flt', 'Status']
+                    for i, nome_col in enumerate(cabecalhos):
+                        hdr_cells[i].text = nome_col
+                        hdr_cells[i].paragraphs[0].runs[0].font.bold = True
+
+                    for _, aluno in df_alunos.iterrows():
+                        row_cells = tabela.add_row().cells
+                        obs = str(aluno['Observacao']).upper()
+                        is_transf_reman = "TRANSF" in obs or "REMAN" in obs
+                        
+                        row_cells[0].text = f"{aluno['Nº']:02d}"
+                        row_cells[1].text = str(aluno['Nome'])
+                        
+                        if is_transf_reman:
+                            row_cells[2].text, row_cells[3].text, row_cells[4].text, row_cells[5].text = "-", "-", "-", "-"
+                            row_cells[6].text = "TRANSF" if "TRANS" in obs else "REMAN"
+                            row_cells[7].text = str(aluno['soma_faltas_parcial'])
+                            row_cells[8].text = str(aluno['situacao'])
+                        else:
+                            for idx_b, num_b in enumerate([1, 2, 3, 4], start=2):
+                                if num_b not in bimestres_selecionados: row_cells[idx_b].text = "-"
+                                else:
+                                    run = row_cells[idx_b].paragraphs[0].add_run(f"{aluno[f'{num_b}ºB']:.1f}")
+                                    if meta_parcial_aprovacao > 0 and aluno[f'{num_b}ºB'] < (valores_bimestres[num_b] * 0.6):
+                                        run.font.color.rgb = RGBColor(255, 0, 0)
+                            
+                            run_total = row_cells[6].paragraphs[0].add_run(f"{aluno['soma_notas_parcial']:.1f}")
+                            if meta_parcial_aprovacao > 0 and aluno['soma_notas_parcial'] < meta_parcial_aprovacao: run_total.font.color.rgb = RGBColor(255, 0, 0)
+                            row_cells[7].text = str(aluno['soma_faltas_parcial'])
+                            row_cells[8].text = str(aluno['situacao'])
+                            if "ALERTA" in aluno['situacao']: row_cells[8].paragraphs[0].runs[0].font.color.rgb = RGBColor(255, 0, 0)
+
+                    doc.add_page_break() 
+                    
+                    doc.add_heading('🛑 ANEXO 1: AUDITORIA DO DIÁRIO (PENDÊNCIAS)', level=2)
+                    doc.add_paragraph("Aulas não lançadas na grade de presença diária:")
+                    if alertas_de_lancamento:
+                        for alerta in alertas_de_lancamento: doc.add_paragraph(alerta, style='List Bullet').runs[0].font.color.rgb = RGBColor(255, 0, 0)
+                    else: doc.add_paragraph("✅ Nenhuma falta de lançamento identificada na chamada.")
+                        
+                    doc.add_paragraph("\nConteúdos pendentes (Tem presença lançada no dia, mas o conteúdo está em branco):")
+                    if alertas_conteudo_faltante:
+                        for alerta in alertas_conteudo_faltante: doc.add_paragraph(alerta, style='List Bullet').runs[0].font.color.rgb = RGBColor(255, 0, 0) 
+                    else: doc.add_paragraph("✅ Todos os dias lançados possuem conteúdos válidos.")
+                    
+                    doc.add_heading('🏫 ANEXO 2: EVENTOS DE SÁBADO', level=2)
+                    if eventos_de_sabado:
+                        for ev in eventos_de_sabado: doc.add_paragraph(ev, style='List Bullet').runs[0].font.color.rgb = RGBColor(0, 51, 153) 
+                    else: doc.add_paragraph("Nenhum evento registrado aos sábados neste período.")
+
+                    doc.add_heading(f'📚 ANEXO 3: CONTEÚDOS MINISTRADOS ({disciplina_nome})', level=2)
+                    if conteudos_no_periodo:
+                        doc.add_heading(f'🎯 DENTRO DO PERÍODO ANALISADO', level=3)
+                        for c in conteudos_no_periodo: doc.add_paragraph(c, style='List Bullet').runs[0].font.color.rgb = RGBColor(0, 128, 0) 
+                    else: doc.add_paragraph("Nenhum conteúdo no período analisado.")
+                    
+                    if conteudos_fora_periodo:
+                        doc.add_heading('⏳ OUTROS PERÍODOS', level=3)
+                        for c in conteudos_fora_periodo: doc.add_paragraph(c, style='List Bullet').runs[0].font.color.rgb = RGBColor(128, 128, 128) 
+
+                    doc.add_heading('⚠️ ANEXO 4: OCORRÊNCIAS REGISTRADAS', level=2)
+                    if ocorrencias_periodo:
+                        doc.add_heading('No Período:', level=3)
+                        for o in ocorrencias_periodo: doc.add_paragraph(o, style='List Bullet')
+                    if ocorrencias_fora:
+                        doc.add_heading('Em Outros Períodos:', level=3)
+                        for o in ocorrencias_fora: doc.add_paragraph(o, style='List Bullet').runs[0].font.color.rgb = RGBColor(128, 128, 128)
+
+                    doc.add_page_break()
+                    doc.add_heading(f'🗓️ ANEXO 5: CALENDÁRIO DE VERIFICAÇÃO ({disciplina_nome})', level=2)
+                    doc.add_paragraph("Visão de conferência: Compare se a quantidade de Aulas (Presenças) bate com a quantidade de Conteúdos registados no mesmo dia.")
+                    
+                    if not resumo_calendario_visual:
+                        doc.add_paragraph("Nenhum lançamento detectado neste período.")
+                    else:
+                        meses_map = {"01": "JANEIRO", "02": "FEVEREIRO", "03": "MARÇO", "04": "ABRIL", "05": "MAIO", "06": "JUNHO", "07": "JULHO", "08": "AGOSTO", "09": "SETEMBRO", "10": "OUTUBRO", "11": "NOVEMBRO", "12": "DEZEMBRO"}
+                        mapa_mensal = {}
+                        for dt_str, dados in resumo_calendario_visual.items():
+                            mes_num = dt_str.split("/")[1]
+                            mes_nome = meses_map.get(mes_num, f"Mês {mes_num}")
+                            if mes_nome not in mapa_mensal: mapa_mensal[mes_nome] = []
+                            
+                            freq_str = f"{dados['freq']} Presença(s)"
+                            cont_str = f"{dados['cont']} Conteúdo(s)"
+                            mapa_mensal[mes_nome].append((extrair_data_segura(dt_str), dt_str, obter_dia_semana(dt_str), freq_str, cont_str))
+                            
+                        meses_ordenados = sorted(mapa_mensal.keys(), key=lambda m: min([item[0] for item in mapa_mensal[m]]))
+                        for mes in meses_ordenados:
+                            doc.add_heading(f'📅 MÊS: {mes}', level=3)
+                            tabela_cal = doc.add_table(rows=1, cols=4)
+                            tabela_cal.style = 'Table Grid'
+                            hdr = tabela_cal.rows[0].cells
+                            hdr[0].text, hdr[1].text, hdr[2].text, hdr[3].text = 'Data', 'Dia da Semana', 'Aulas Lançadas', 'Conteúdos Escritos'
+                            for c_cell in hdr: c_cell.paragraphs[0].runs[0].font.bold = True
+                            
+                            mapa_mensal[mes].sort(key=lambda x: x[0])
+                            for item in mapa_mensal[mes]:
+                                row = tabela_cal.add_row().cells
+                                row[0].text, row[1].text, row[2].text, row[3].text = item[1], item[2], item[3], item[4]
+                                if item[3].split(" ")[0] != item[4].split(" ")[0]:
+                                    row[3].paragraphs[0].runs[0].font.color.rgb = RGBColor(204, 102, 0)
+
+                    # --- EXPORTAÇÃO WEB SEGURA (Sem usar os discos do servidor) ---
+                    nome_seguro = re.sub(r'[\\/*?:"<>|]', "_", disciplina_nome)
+                    nome_arquivo_word = f"Relatorio_{nome_seguro}.docx"
+                    
+                    buffer = io.BytesIO()
+                    doc.save(buffer)
+                    buffer.seek(0)
+                    
+                    st.success("✅ Relatório gerado com sucesso!")
+                    
+                    # Cria o botão mágico de download do Streamlit
+                    st.download_button(
+                        label="📥 Clique aqui para BAIXAR O RELATÓRIO",
+                        data=buffer,
+                        file_name=nome_arquivo_word,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+
+            except Exception as e:
+                st.error(f"❌ Ocorreu um erro a processar o documento: {e}")
